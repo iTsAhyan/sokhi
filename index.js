@@ -18,14 +18,17 @@ const MY_NUMBER = "8801821530064";
 const ALLOWED_NUMBERS = [
   "8801738834132"
 ];
-// WhatsApp @lid আইডি আসলে লগ দেখে এখানে যুক্ত করবেন (যেমন: "123456789012345")
+// লগ বা /debug/msgs দেখে @lid এর সংখ্যাটি এখানে বসাতে পারেন (যেমন: "123456789012345")
 const ALLOWED_LIDS = [];
+// চাইলে পুরো remoteJid ও বসাতে পারেন (যেমন: "123456789012345@lid")
+const ALLOWED_JIDS = [];
 
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER || "";
 const AUTH_DIR = "./auth_info";
 
 let isBotEnabled = true;
 let waSock = null;
+const recentDebugMsgs = [];
 
 const IGNORED_SHORT_MESSAGES = new Set([
   "hmm", "hm", "hmmm", "hmmmm",
@@ -78,6 +81,17 @@ app.post("/bot/toggle", (req, res) => {
   res.json({ botEnabled: isBotEnabled });
 });
 
+// ব্রাউজার থেকে শেষ আসা মেসেজের remoteJid ও senderId দেখার রাউট
+app.get("/debug/msgs", (req, res) => {
+  res.json({
+    botEnabled: isBotEnabled,
+    whatsappConnected: Boolean(waSock?.user),
+    userJid: waSock?.user?.id || null,
+    count: recentDebugMsgs.length,
+    messages: recentDebugMsgs
+  });
+});
+
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || "").trim();
@@ -100,7 +114,6 @@ async function startWhatsAppBot() {
     version,
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: !PAIRING_PHONE_NUMBER,
     browser: ["Ubuntu", "Chrome", "20.0.04"]
   });
 
@@ -122,7 +135,11 @@ async function startWhatsAppBot() {
   }
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr && !PAIRING_PHONE_NUMBER) {
+      console.log("QR জেনারেট হয়েছে। পেয়ারিং কোড চাইলে PAIRING_PHONE_NUMBER সেট করুন।");
+    }
 
     if (connection === "open") {
       console.log("WhatsApp Baileys সফলভাবে কানেক্ট হয়েছে!");
@@ -143,7 +160,7 @@ async function startWhatsAppBot() {
 
     try {
       const msg = messages[0];
-      if (!msg?.message || msg.key.fromMe) return;
+      if (!msg?.message) return;
 
       const remoteJid = msg.key.remoteJid || "";
       if (remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return;
@@ -152,11 +169,31 @@ async function startWhatsAppBot() {
       const rawText = extractMessageText(msg.message).trim();
       if (!senderId || !rawText) return;
 
-      console.log(`[MSG] remoteJid=${remoteJid} | senderId=${senderId} | text="${rawText}"`);
+      const isSelfChat =
+        senderId === MY_NUMBER ||
+        (waSock?.user?.id && extractIdPart(waSock.user.id) === senderId);
+
+      // ডিবাগ লিস্টে শেষ ১৫টি মেসেজ সংরক্ষণ
+      recentDebugMsgs.unshift({
+        time: new Date().toISOString(),
+        fromMe: Boolean(msg.key.fromMe),
+        isSelfChat,
+        remoteJid,
+        senderId,
+        text: rawText
+      });
+      if (recentDebugMsgs.length > 15) {
+        recentDebugMsgs.pop();
+      }
+
+      console.log(
+        `[MSG] fromMe=${Boolean(msg.key.fromMe)} self=${isSelfChat} jid=${remoteJid} id=${senderId} text="${rawText}"`
+      );
 
       const normalized = rawText.toLowerCase();
 
-      if (senderId === MY_NUMBER) {
+      // ১. নিজের চ্যাট বা নিজের নম্বর থেকে কমান্ড পাঠালে কাজ করবে (fromMe হলেও)
+      if (isSelfChat) {
         if (normalized === "/bot off" || normalized === "bot off") {
           isBotEnabled = false;
           await sendWhatsAppMessage(remoteJid, "হুম গো কলিজা!");
@@ -177,20 +214,30 @@ async function startWhatsAppBot() {
         return;
       }
 
+      // অন্য কারও পাঠানো নিজের মেসেজে (fromMe: true) বট রিপ্লাই দেবে না
+      if (msg.key.fromMe) return;
+
+      // ২. বট বন্ধ থাকলে কোনো রিপ্লাই দেবে না
       if (!isBotEnabled) return;
 
+      // ৩. শুধু অনুমোদিত নম্বর / LID / JID-এ রিপ্লাই দেবে
       const isAllowed =
-        ALLOWED_NUMBERS.includes(senderId) || ALLOWED_LIDS.includes(senderId);
+        ALLOWED_NUMBERS.includes(senderId) ||
+        ALLOWED_LIDS.includes(senderId) ||
+        ALLOWED_JIDS.includes(remoteJid);
+
       if (!isAllowed) {
-        console.log(`[SKIP] Not allowed senderId=${senderId}`);
+        console.log(`[SKIP] Not allowed jid=${remoteJid} id=${senderId}`);
         return;
       }
 
+      // ৪. অপ্রয়োজনীয় ছোট মেসেজ এড়িয়ে চলবে
       if (shouldIgnoreShortMessage(rawText)) {
         console.log(`[SKIP] Ignored short message: "${rawText}"`);
         return;
       }
 
+      // ৫. Gemini দিয়ে রিপ্লাই তৈরি করে পাঠানো
       const replyText = await generatePersonaReply(rawText);
       if (replyText) {
         await sendWhatsAppMessage(remoteJid, replyText);
@@ -260,4 +307,4 @@ app.listen(PORT, () => {
     console.error("Failed to start WhatsApp bot:", err);
   });
 });
-                         
+    
