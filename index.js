@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import { GoogleGenAI } from "@google/genai";
 import makeWASocket, {
   useMultiFileAuthState,
@@ -15,29 +15,15 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- সেটিংস ---
 const MY_NUMBER = "8801821530064";
-const ALLOWED_NUMBERS = [
-  "8801738834132"
-];
-// লগ বা /debug/msgs দেখে @lid এর সংখ্যাটি এখানে বসাতে পারেন (যেমন: "123456789012345")
-const ALLOWED_LIDS = [];
-// চাইলে পুরো remoteJid ও বসাতে পারেন (যেমন: "123456789012345@lid")
-const ALLOWED_JIDS = [];
 
+// ঐচ্ছিক: পেয়ারিং কোড চাইলে Environment-এ PAIRING_PHONE_NUMBER দিন
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER || "";
 const AUTH_DIR = "./auth_info";
 
+// শুরুতে বট চালু (true) থাকবে; অফ করলে false হবে
 let isBotEnabled = true;
 let waSock = null;
 const recentDebugMsgs = [];
-
-const IGNORED_SHORT_MESSAGES = new Set([
-  "hmm", "hm", "hmmm", "hmmmm",
-  "ok", "okay", "k", "kk",
-  "haha", "hahaha", "lol", "lmao",
-  "achha", "acha", "accha",
-  "thnx", "thanks", "ty",
-  "👍", "👌", "😂", "🤣", "❤️", "😊"
-]);
 
 const PERSONA_INSTRUCTION = `
 তুমি আমার হয়ে মেসেজের রিপ্লাই দিচ্ছ। আমার মতো করেই কথা বলবে—একদম স্বাভাবিক, আন্তরিক, হালকা মজার ও খুনসুটিপূর্ণ, কিন্তু কোনোভাবেই রোবটিক বা বানানো লাগবে না।
@@ -55,6 +41,7 @@ const PERSONA_INSTRUCTION = `
 - "হাহা, ঠিক আছে, মানলাম। আর কিছু?"
 `;
 
+// --- হেলথ ও কন্ট্রোল রাউট ---
 app.get("/", (req, res) => {
   res.send("Bot server is awake and running.");
 });
@@ -81,7 +68,7 @@ app.post("/bot/toggle", (req, res) => {
   res.json({ botEnabled: isBotEnabled });
 });
 
-// ব্রাউজার থেকে শেষ আসা মেসেজের remoteJid ও senderId দেখার রাউট
+// ব্রাউজার থেকে শেষ আসা মেসেজগুলো দেখার রাউট
 app.get("/debug/msgs", (req, res) => {
   res.json({
     botEnabled: isBotEnabled,
@@ -92,6 +79,7 @@ app.get("/debug/msgs", (req, res) => {
   });
 });
 
+// সরাসরি Gemini টেস্ট করার রাউট
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || "").trim();
@@ -106,6 +94,7 @@ app.post("/chat", async (req, res) => {
   }
 });
 
+// --- WhatsApp Baileys কানেকশন ---
 async function startWhatsAppBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -156,127 +145,119 @@ async function startWhatsAppBot() {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
+    if (type !== "notify" && type !== "append") return;
 
-    try {
-      const msg = messages[0];
-      if (!msg?.message) return;
+    for (const msg of messages) {
+      try {
+        if (!msg?.message) continue;
 
-      const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return;
+        const remoteJid = msg.key.remoteJid || "";
+        // শুধু গ্রুপ ও স্ট্যাটাস ব্রডকাস্ট বাদ
+        if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") {
+          continue;
+        }
 
-      const senderId = extractIdPart(remoteJid);
-      const rawText = extractMessageText(msg.message).trim();
-      if (!senderId || !rawText) return;
+        const senderId = extractIdPart(remoteJid);
+        const rawText = extractMessageText(msg.message).trim();
+        if (!senderId || !rawText) continue;
 
-      const isSelfChat =
-        senderId === MY_NUMBER ||
-        (waSock?.user?.id && extractIdPart(waSock.user.id) === senderId);
+        const isSelfChat =
+          senderId === MY_NUMBER ||
+          (waSock?.user?.id && extractIdPart(waSock.user.id) === senderId);
 
-      // ডিবাগ লিস্টে শেষ ১৫টি মেসেজ সংরক্ষণ
-      recentDebugMsgs.unshift({
-        time: new Date().toISOString(),
-        fromMe: Boolean(msg.key.fromMe),
-        isSelfChat,
-        remoteJid,
-        senderId,
-        text: rawText
-      });
-      if (recentDebugMsgs.length > 15) {
-        recentDebugMsgs.pop();
-      }
+        recentDebugMsgs.unshift({
+          time: new Date().toISOString(),
+          fromMe: Boolean(msg.key.fromMe),
+          isSelfChat,
+          remoteJid,
+          senderId,
+          text: rawText
+        });
+        if (recentDebugMsgs.length > 25) {
+          recentDebugMsgs.pop();
+        }
 
-      console.log(
-        `[MSG] fromMe=${Boolean(msg.key.fromMe)} self=${isSelfChat} jid=${remoteJid} id=${senderId} text="${rawText}"`
-      );
+        const normalized = rawText.toLowerCase();
 
-      const normalized = rawText.toLowerCase();
-
-      // ১. নিজের চ্যাট বা নিজের নম্বর থেকে কমান্ড পাঠালে কাজ করবে (fromMe হলেও)
-      if (isSelfChat) {
-        if (normalized === "/bot off" || normalized === "bot off") {
+        // ১. অফ কমান্ড দিলে বট বন্ধ হবে
+        if (
+          normalized === "off" ||
+          normalized === "/bot off" ||
+          normalized === "bot off"
+        ) {
           isBotEnabled = false;
           await sendWhatsAppMessage(remoteJid, "হুম গো কলিজা!");
-          return;
+          continue;
         }
-        if (normalized === "/bot on" || normalized === "bot on") {
+
+        // ২. অন কমান্ড দিলে বট আবার চালু হবে
+        if (
+          normalized === "on" ||
+          normalized === "/bot on" ||
+          normalized === "bot on"
+        ) {
           isBotEnabled = true;
           await sendWhatsAppMessage(remoteJid, "হুম গো জান!");
-          return;
+          continue;
         }
-        if (normalized === "/bot status") {
+
+        if (isSelfChat && normalized === "/bot status") {
           await sendWhatsAppMessage(
             remoteJid,
             `আমি এখন ${isBotEnabled ? "ON (চালু)" : "OFF (বন্ধ)"} আছে।`
           );
-          return;
+          continue;
         }
-        return;
+
+        // নিজের পাঠানো সাধারণ মেসেজে রিপ্লাই লুপ এড়ানো
+        if (msg.key.fromMe) continue;
+
+        // ৩. বট অফ থাকলে রিপ্লাই দেবে না
+        if (!isBotEnabled) continue;
+
+        // ৪. কোনো বাছাবাছি ছাড়া আসা প্রতিটি ব্যক্তিগত মেসেজে রিপ্লাই পাঠানো
+        const replyText = await generatePersonaReply(rawText);
+        if (replyText) {
+          await sendWhatsAppMessage(remoteJid, replyText);
+        }
+      } catch (err) {
+        console.error("Message handling error:", err);
       }
-
-      // অন্য কারও পাঠানো নিজের মেসেজে (fromMe: true) বট রিপ্লাই দেবে না
-      if (msg.key.fromMe) return;
-
-      // ২. বট বন্ধ থাকলে কোনো রিপ্লাই দেবে না
-      if (!isBotEnabled) return;
-
-      // ৩. শুধু অনুমোদিত নম্বর / LID / JID-এ রিপ্লাই দেবে
-      const isAllowed =
-        ALLOWED_NUMBERS.includes(senderId) ||
-        ALLOWED_LIDS.includes(senderId) ||
-        ALLOWED_JIDS.includes(remoteJid);
-
-      if (!isAllowed) {
-        console.log(`[SKIP] Not allowed jid=${remoteJid} id=${senderId}`);
-        return;
-      }
-
-      // ৪. অপ্রয়োজনীয় ছোট মেসেজ এড়িয়ে চলবে
-      if (shouldIgnoreShortMessage(rawText)) {
-        console.log(`[SKIP] Ignored short message: "${rawText}"`);
-        return;
-      }
-
-      // ৫. Gemini দিয়ে রিপ্লাই তৈরি করে পাঠানো
-      const replyText = await generatePersonaReply(rawText);
-      if (replyText) {
-        await sendWhatsAppMessage(remoteJid, replyText);
-        console.log(`[SENT] to ${remoteJid}: "${replyText}"`);
-      }
-    } catch (err) {
-      console.error("Message handling error:", err);
     }
   });
 }
 
+// --- Helper Functions ---
 function extractIdPart(jid) {
   const userPart = jid.split("@")[0] || "";
   return userPart.split(":")[0].replace(/\D/g, "");
 }
 
-function extractMessageText(messageObj) {
-  return (
-    messageObj.conversation ||
-    messageObj.extendedTextMessage?.text ||
-    messageObj.imageMessage?.caption ||
-    messageObj.videoMessage?.caption ||
-    ""
-  );
+function unwrapMessageContent(messageObj) {
+  let curr = messageObj;
+  while (curr) {
+    if (curr.ephemeralMessage?.message) {
+      curr = curr.ephemeralMessage.message;
+    } else if (curr.viewOnceMessage?.message) {
+      curr = curr.viewOnceMessage.message;
+    } else if (curr.viewOnceMessageV2?.message) {
+      curr = curr.viewOnceMessageV2.message;
+    } else {
+      break;
+    }
+  }
+  return curr || {};
 }
 
-function shouldIgnoreShortMessage(text) {
-  const clean = text.toLowerCase().replace(/[.!?]+$/g, "").trim();
-
-  if (IGNORED_SHORT_MESSAGES.has(clean)) {
-    return true;
-  }
-
-  const withoutSpaces = clean.replace(/\s+/g, "");
-  if (withoutSpaces.length <= 2 && !/[a-z0-9\u0980-\u09FF]/i.test(withoutSpaces)) {
-    return true;
-  }
-
-  return false;
+function extractMessageText(messageObj) {
+  const m = unwrapMessageContent(messageObj);
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    ""
+  );
 }
 
 async function generatePersonaReply(userText) {
@@ -307,4 +288,3 @@ app.listen(PORT, () => {
     console.error("Failed to start WhatsApp bot:", err);
   });
 });
-    
