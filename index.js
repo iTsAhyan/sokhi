@@ -14,20 +14,19 @@ const PORT = process.env.PORT || 10000;
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- সেটিংস ---
-const MY_NUMBER = "8801821530064"; // আপনার নিজের WhatsApp নম্বর (কান্ট্রি কোডসহ, + ছাড়া)
+const MY_NUMBER = "8801821530064";
 const ALLOWED_NUMBERS = [
-  "8801738834132" // গার্লফ্রেন্ডের WhatsApp নম্বর (কান্ট্রি কোডসহ, + ছাড়া)
+  "8801738834132"
 ];
+// WhatsApp @lid আইডি আসলে লগ দেখে এখানে যুক্ত করবেন (যেমন: "123456789012345")
+const ALLOWED_LIDS = [];
 
-// ঐচ্ছিক: Render Logs-এ Pairing Code চাইলে আপনার নম্বর দিন, নাহলে QR কোড দেখাবে
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER || "";
 const AUTH_DIR = "./auth_info";
 
-// যখন ইচ্ছা তখন বট অন/অফ করার স্টেট (শুরুতে true)
 let isBotEnabled = true;
 let waSock = null;
 
-// যেসব ছোট মেসেজে অযথা রিপ্লাই দিয়ে কোটা নষ্ট করবে না
 const IGNORED_SHORT_MESSAGES = new Set([
   "hmm", "hm", "hmmm", "hmmmm",
   "ok", "okay", "k", "kk",
@@ -53,7 +52,6 @@ const PERSONA_INSTRUCTION = `
 - "হাহা, ঠিক আছে, মানলাম। আর কিছু?"
 `;
 
-// --- হেলথ ও পিং রাউট ---
 app.get("/", (req, res) => {
   res.send("Bot server is awake and running.");
 });
@@ -67,7 +65,6 @@ app.get("/ping", (req, res) => {
   });
 });
 
-// ব্রাউজার বা API দিয়ে বট অন/অফ করার সহজ রাউট
 app.get("/bot/status", (req, res) => {
   res.json({ botEnabled: isBotEnabled });
 });
@@ -81,14 +78,12 @@ app.post("/bot/toggle", (req, res) => {
   res.json({ botEnabled: isBotEnabled });
 });
 
-// --- সরাসরি Gemini টেস্ট করার রাউট ---
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || "").trim();
     if (!userMessage) {
       return res.status(400).json({ error: "Message is required" });
     }
-
     const reply = await generatePersonaReply(userMessage);
     res.json({ reply });
   } catch (err) {
@@ -97,7 +92,6 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// --- WhatsApp Baileys কানেকশন ---
 async function startWhatsAppBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -113,7 +107,6 @@ async function startWhatsAppBot() {
   waSock = sock;
   sock.ev.on("creds.update", saveCreds);
 
-  // Pairing Code ব্যবহার করতে চাইলে (ঐচ্ছিক)
   if (PAIRING_PHONE_NUMBER && !sock.authState.creds.registered) {
     setTimeout(async () => {
       try {
@@ -129,11 +122,7 @@ async function startWhatsAppBot() {
   }
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr && !PAIRING_PHONE_NUMBER) {
-      console.log("QR কোড জেনারেট হয়েছে (লগ দেখুন বা পেয়ারিং কোড ব্যবহার করুন)।");
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === "open") {
       console.log("WhatsApp Baileys সফলভাবে কানেক্ট হয়েছে!");
@@ -157,17 +146,17 @@ async function startWhatsAppBot() {
       if (!msg?.message || msg.key.fromMe) return;
 
       const remoteJid = msg.key.remoteJid || "";
-      // গ্রুপ চ্যাট এড়িয়ে শুধু ব্যক্তিগত চ্যাট নেওয়া
       if (remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return;
 
-      const senderNumber = extractPhoneNumber(remoteJid);
+      const senderId = extractIdPart(remoteJid);
       const rawText = extractMessageText(msg.message).trim();
-      if (!senderNumber || !rawText) return;
+      if (!senderId || !rawText) return;
+
+      console.log(`[MSG] remoteJid=${remoteJid} | senderId=${senderId} | text="${rawText}"`);
 
       const normalized = rawText.toLowerCase();
 
-      // ১. আপনি নিজে নিজের নম্বর (বা নিজের চ্যাট) থেকে কমান্ড পাঠালে বট অন/অফ হবে
-      if (senderNumber === MY_NUMBER) {
+      if (senderId === MY_NUMBER) {
         if (normalized === "/bot off" || normalized === "bot off") {
           isBotEnabled = false;
           await sendWhatsAppMessage(remoteJid, "হুম গো কলিজা!");
@@ -188,19 +177,24 @@ async function startWhatsAppBot() {
         return;
       }
 
-      // ২. বট বন্ধ থাকলে কোনো রিপ্লাই দেবে না
       if (!isBotEnabled) return;
 
-      // ৩. শুধু অনুমোদিত নম্বরে (গার্লফ্রেন্ডের নম্বর) রিপ্লাই দেবে
-      if (!ALLOWED_NUMBERS.includes(senderNumber)) return;
+      const isAllowed =
+        ALLOWED_NUMBERS.includes(senderId) || ALLOWED_LIDS.includes(senderId);
+      if (!isAllowed) {
+        console.log(`[SKIP] Not allowed senderId=${senderId}`);
+        return;
+      }
 
-      // ৪. অপ্রয়োজনীয় ছোট মেসেজ এড়িয়ে চলবে
-      if (shouldIgnoreShortMessage(rawText)) return;
+      if (shouldIgnoreShortMessage(rawText)) {
+        console.log(`[SKIP] Ignored short message: "${rawText}"`);
+        return;
+      }
 
-      // ৫. Gemini দিয়ে রিপ্লাই তৈরি করে পাঠানো
       const replyText = await generatePersonaReply(rawText);
       if (replyText) {
         await sendWhatsAppMessage(remoteJid, replyText);
+        console.log(`[SENT] to ${remoteJid}: "${replyText}"`);
       }
     } catch (err) {
       console.error("Message handling error:", err);
@@ -208,8 +202,7 @@ async function startWhatsAppBot() {
   });
 }
 
-// --- Helper Functions ---
-function extractPhoneNumber(jid) {
+function extractIdPart(jid) {
   const userPart = jid.split("@")[0] || "";
   return userPart.split(":")[0].replace(/\D/g, "");
 }
@@ -267,3 +260,4 @@ app.listen(PORT, () => {
     console.error("Failed to start WhatsApp bot:", err);
   });
 });
+                         
