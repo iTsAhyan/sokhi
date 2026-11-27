@@ -1,6 +1,5 @@
 import "dotenv/config";
 import express from "express";
-import { GoogleGenAI } from "@google/genai";
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
 import pino from "pino";
 import path from "node:path";
@@ -11,15 +10,15 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = Number(process.env.PORT || 10000);
-const API_KEY = process.env.GEMINI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const PAIRING_PHONE_NUMBER = (process.env.PAIRING_PHONE_NUMBER || "").replace(/\D/g, "");
 const MY_NUMBER = (process.env.MY_NUMBER || "8801604444716").replace(/\D/g, "");
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+const GROQ_FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || "openai/gpt-oss-120b";
 const AUTH_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "auth_info");
 
-if (!API_KEY) throw new Error("GEMINI_API_KEY is required");
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is required");
 
 let isBotEnabled = true;
 let waSock = null;
@@ -97,46 +96,65 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite";
-
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-function isTemporaryGeminiError(err) {
-  const status = err?.status || err?.code || err?.error?.code;
-  const message = String(err?.message || err);
-  return status === 503 || status === "503" ||
-    /UNAVAILABLE|high demand|temporarily unavailable|overloaded/i.test(message);
+async function generateWithModel(model, userText) {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${GROQ_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: PERSONA_INSTRUCTION },
+        { role: "user", content: userText }
+      ],
+      temperature: 0.85,
+      max_completion_tokens: 160
+    })
+  });
+
+  const raw = await response.text();
+  let data;
+  try { data = JSON.parse(raw); } catch { data = { error: { message: raw } }; }
+
+  if (!response.ok) {
+    const err = new Error(data?.error?.message || `Groq API HTTP ${response.status}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  return (data?.choices?.[0]?.message?.content || "").trim();
 }
 
-async function generateWithModel(model, userText) {
-  const response = await ai.models.generateContent({
-    model,
-    contents: userText,
-    config: { systemInstruction: PERSONA_INSTRUCTION, temperature: 0.85, maxOutputTokens: 120 }
-  });
-  return (response.text || "").trim();
+function isRetryableGroqError(err) {
+  const status = Number(err?.status || err?.code || 0);
+  return status === 429 || status >= 500 ||
+    /rate limit|temporarily unavailable|overloaded|timeout/i.test(String(err?.message || err));
 }
 
 async function generatePersonaReply(userText) {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return await generateWithModel(GEMINI_MODEL, userText);
+      return await generateWithModel(GROQ_MODEL, userText);
     } catch (err) {
       lastErr = err;
-      if (!isTemporaryGeminiError(err)) throw err;
-      const delay = 1500 * (2 ** attempt);
-      console.warn(`Gemini ${GEMINI_MODEL} temporary error; retry ${attempt + 1}/3 in ${delay}ms`);
+      if (!isRetryableGroqError(err)) throw err;
+      const delay = 1200 * (2 ** attempt);
+      console.warn(`Groq ${GROQ_MODEL} retry ${attempt + 1}/3 in ${delay}ms`);
       await wait(delay);
     }
   }
 
-  if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
-    console.warn(`Primary model unavailable; trying fallback ${GEMINI_FALLBACK_MODEL}`);
+  if (GROQ_FALLBACK_MODEL && GROQ_FALLBACK_MODEL !== GROQ_MODEL) {
+    console.warn(`Primary Groq model unavailable; trying ${GROQ_FALLBACK_MODEL}`);
     try {
-      return await generateWithModel(GEMINI_FALLBACK_MODEL, userText);
+      return await generateWithModel(GROQ_FALLBACK_MODEL, userText);
     } catch (fallbackErr) {
-      lastError = `Gemini primary and fallback failed: ${fallbackErr?.message || String(fallbackErr)}`;
+      lastError = `Groq primary and fallback failed: ${fallbackErr?.message || String(fallbackErr)}`;
       console.error(lastError);
       throw fallbackErr;
     }
