@@ -1,4 +1,4 @@
- import express from "express";
+import express from "express";
 import { GoogleGenAI } from "@google/genai";
 import makeWASocket, {
   useMultiFileAuthState,
@@ -15,14 +15,12 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- সেটিংস ---
 const MY_NUMBER = "8801821530064";
-
-// ঐচ্ছিক: পেয়ারিং কোড চাইলে Environment-এ PAIRING_PHONE_NUMBER দিন
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER || "";
 const AUTH_DIR = "./auth_info";
 
-// শুরুতে বট চালু (true) থাকবে; অফ করলে false হবে
 let isBotEnabled = true;
 let waSock = null;
+let lastError = null;
 const recentDebugMsgs = [];
 
 const PERSONA_INSTRUCTION = `
@@ -41,7 +39,16 @@ const PERSONA_INSTRUCTION = `
 - "হাহা, ঠিক আছে, মানলাম। আর কিছু?"
 `;
 
-// --- হেলথ ও কন্ট্রোল রাউট ---
+function pushDebugLog(entry) {
+  recentDebugMsgs.unshift({
+    time: new Date().toISOString(),
+    ...entry
+  });
+  if (recentDebugMsgs.length > 30) {
+    recentDebugMsgs.pop();
+  }
+}
+
 app.get("/", (req, res) => {
   res.send("Bot server is awake and running.");
 });
@@ -51,6 +58,7 @@ app.get("/ping", (req, res) => {
     status: "ok",
     botEnabled: isBotEnabled,
     whatsappConnected: Boolean(waSock?.user),
+    lastError,
     time: new Date().toISOString()
   });
 });
@@ -68,18 +76,17 @@ app.post("/bot/toggle", (req, res) => {
   res.json({ botEnabled: isBotEnabled });
 });
 
-// ব্রাউজার থেকে শেষ আসা মেসেজগুলো দেখার রাউট
 app.get("/debug/msgs", (req, res) => {
   res.json({
     botEnabled: isBotEnabled,
     whatsappConnected: Boolean(waSock?.user),
     userJid: waSock?.user?.id || null,
+    lastError,
     count: recentDebugMsgs.length,
     messages: recentDebugMsgs
   });
 });
 
-// সরাসরি Gemini টেস্ট করার রাউট
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || "").trim();
@@ -89,12 +96,13 @@ app.post("/chat", async (req, res) => {
     const reply = await generatePersonaReply(userMessage);
     res.json({ reply });
   } catch (err) {
+    const errMsg = err?.message || String(err);
+    lastError = `chat_route: ${errMsg}`;
     console.error("Chat error:", err);
-    res.status(500).json({ error: "Failed to generate reply" });
+    res.status(500).json({ error: errMsg });
   }
 });
 
-// --- WhatsApp Baileys কানেকশন ---
 async function startWhatsAppBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -118,6 +126,7 @@ async function startWhatsAppBot() {
         console.log(`WhatsApp Pairing Code: ${code}`);
         console.log(`==============================\n`);
       } catch (err) {
+        lastError = `pairing: ${err?.message || String(err)}`;
         console.error("Pairing code error:", err);
       }
     }, 3000);
@@ -148,38 +157,32 @@ async function startWhatsAppBot() {
     if (type !== "notify" && type !== "append") return;
 
     for (const msg of messages) {
+      const remoteJid = msg?.key?.remoteJid || "";
+      const senderId = extractIdPart(remoteJid);
+      const rawText = msg?.message ? extractMessageText(msg.message).trim() : "";
+
       try {
         if (!msg?.message) continue;
-
-        const remoteJid = msg.key.remoteJid || "";
-        // শুধু গ্রুপ ও স্ট্যাটাস ব্রডকাস্ট বাদ
         if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") {
           continue;
         }
-
-        const senderId = extractIdPart(remoteJid);
-        const rawText = extractMessageText(msg.message).trim();
         if (!senderId || !rawText) continue;
 
         const isSelfChat =
           senderId === MY_NUMBER ||
           (waSock?.user?.id && extractIdPart(waSock.user.id) === senderId);
 
-        recentDebugMsgs.unshift({
-          time: new Date().toISOString(),
+        pushDebugLog({
+          step: "received",
           fromMe: Boolean(msg.key.fromMe),
           isSelfChat,
           remoteJid,
           senderId,
           text: rawText
         });
-        if (recentDebugMsgs.length > 25) {
-          recentDebugMsgs.pop();
-        }
 
         const normalized = rawText.toLowerCase();
 
-        // ১. অফ কমান্ড দিলে বট বন্ধ হবে
         if (
           normalized === "off" ||
           normalized === "/bot off" ||
@@ -187,10 +190,10 @@ async function startWhatsAppBot() {
         ) {
           isBotEnabled = false;
           await sendWhatsAppMessage(remoteJid, "হুম গো কলিজা!");
+          pushDebugLog({ step: "sent_off", remoteJid });
           continue;
         }
 
-        // ২. অন কমান্ড দিলে বট আবার চালু হবে
         if (
           normalized === "on" ||
           normalized === "/bot on" ||
@@ -198,6 +201,7 @@ async function startWhatsAppBot() {
         ) {
           isBotEnabled = true;
           await sendWhatsAppMessage(remoteJid, "হুম গো জান!");
+          pushDebugLog({ step: "sent_on", remoteJid });
           continue;
         }
 
@@ -206,28 +210,39 @@ async function startWhatsAppBot() {
             remoteJid,
             `আমি এখন ${isBotEnabled ? "ON (চালু)" : "OFF (বন্ধ)"} আছে।`
           );
+          pushDebugLog({ step: "sent_status", remoteJid });
           continue;
         }
 
-        // নিজের পাঠানো সাধারণ মেসেজে রিপ্লাই লুপ এড়ানো
         if (msg.key.fromMe) continue;
+        if (!isBotEnabled) {
+          pushDebugLog({ step: "skipped_bot_off", remoteJid });
+          continue;
+        }
 
-        // ৩. বট অফ থাকলে রিপ্লাই দেবে না
-        if (!isBotEnabled) continue;
-
-        // ৪. কোনো বাছাবাছি ছাড়া আসা প্রতিটি ব্যক্তিগত মেসেজে রিপ্লাই পাঠানো
         const replyText = await generatePersonaReply(rawText);
+        pushDebugLog({ step: "gemini_ok", remoteJid, replyPreview: replyText.slice(0, 60) });
+
         if (replyText) {
           await sendWhatsAppMessage(remoteJid, replyText);
+          pushDebugLog({ step: "sent_reply", remoteJid, replyText });
         }
       } catch (err) {
+        const errMsg = err?.message || String(err);
+        lastError = `msg_loop: ${errMsg}`;
+        pushDebugLog({
+          step: "error",
+          remoteJid,
+          senderId,
+          text: rawText,
+          error: errMsg
+        });
         console.error("Message handling error:", err);
       }
     }
   });
 }
 
-// --- Helper Functions ---
 function extractIdPart(jid) {
   const userPart = jid.split("@")[0] || "";
   return userPart.split(":")[0].replace(/\D/g, "");
@@ -276,8 +291,7 @@ async function generatePersonaReply(userText) {
 
 async function sendWhatsAppMessage(jid, text) {
   if (!waSock) {
-    console.log(`[Dry Run -> ${jid}]: ${text}`);
-    return;
+    throw new Error("waSock is null");
   }
   await waSock.sendMessage(jid, { text });
 }
@@ -285,6 +299,7 @@ async function sendWhatsAppMessage(jid, text) {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startWhatsAppBot().catch((err) => {
+    lastError = `start_bot: ${err?.message || String(err)}`;
     console.error("Failed to start WhatsApp bot:", err);
   });
 });
