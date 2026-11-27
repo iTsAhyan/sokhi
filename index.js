@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT || 10000);
 const API_KEY = process.env.GEMINI_API_KEY;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 const PAIRING_PHONE_NUMBER = (process.env.PAIRING_PHONE_NUMBER || "").replace(/\D/g, "");
-const MY_NUMBER = (process.env.MY_NUMBER || "8801821530064").replace(/\D/g, "");
+const MY_NUMBER = (process.env.MY_NUMBER || "8801604444716").replace(/\D/g, "");
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const AUTH_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "auth_info");
 
