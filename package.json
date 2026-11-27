@@ -6,7 +6,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
     "@whiskeysockets/baileys": "^6.7.16",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
@@ -14,5 +13,6 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "type": "module"
 }
