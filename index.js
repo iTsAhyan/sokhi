@@ -97,13 +97,51 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-async function generatePersonaReply(userText) {
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite";
+
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isTemporaryGeminiError(err) {
+  const status = err?.status || err?.code || err?.error?.code;
+  const message = String(err?.message || err);
+  return status === 503 || status === "503" ||
+    /UNAVAILABLE|high demand|temporarily unavailable|overloaded/i.test(message);
+}
+
+async function generateWithModel(model, userText) {
   const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
+    model,
     contents: userText,
     config: { systemInstruction: PERSONA_INSTRUCTION, temperature: 0.85, maxOutputTokens: 120 }
   });
   return (response.text || "").trim();
+}
+
+async function generatePersonaReply(userText) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await generateWithModel(GEMINI_MODEL, userText);
+    } catch (err) {
+      lastErr = err;
+      if (!isTemporaryGeminiError(err)) throw err;
+      const delay = 1500 * (2 ** attempt);
+      console.warn(`Gemini ${GEMINI_MODEL} temporary error; retry ${attempt + 1}/3 in ${delay}ms`);
+      await wait(delay);
+    }
+  }
+
+  if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
+    console.warn(`Primary model unavailable; trying fallback ${GEMINI_FALLBACK_MODEL}`);
+    try {
+      return await generateWithModel(GEMINI_FALLBACK_MODEL, userText);
+    } catch (fallbackErr) {
+      lastError = `Gemini primary and fallback failed: ${fallbackErr?.message || String(fallbackErr)}`;
+      console.error(lastError);
+      throw fallbackErr;
+    }
+  }
+  throw lastErr;
 }
 
 function scheduleReconnect() {
